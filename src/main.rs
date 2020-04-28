@@ -2,16 +2,14 @@
 extern crate vulkano;
 #[macro_use]
 extern crate log;
+mod texture;
 mod vulkano_win;
-// extern crate winit;
-// extern crate cgmath;
 use env_logger;
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-// use winit::{EventLoop, WindowBuilder, Window, dpi::LogicalSize, Event, WindowEvent};
 use vulkano_win::VkSurfaceBuild;
 use winit::{
     dpi::LogicalSize,
@@ -24,7 +22,7 @@ use cgmath::{Deg, Matrix4, Point3, Rad, Vector3};
 use vulkano::buffer::{
     immutable::ImmutableBuffer, BufferAccess, BufferUsage, CpuAccessibleBuffer, TypedBufferAccess,
 };
-use vulkano::command_buffer::{AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState};
+use vulkano::command_buffer::{AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState, CommandBuffer};
 use vulkano::descriptor::{
     descriptor_set::{PersistentDescriptorSet, UnsafeDescriptorSetLayout},
     PipelineLayoutAbstract,
@@ -145,10 +143,11 @@ struct HelloTriangleApplication {
 
     command_buffers: Vec<Arc<AutoCommandBuffer>>,
 
-    previous_frame_end: Option<Box<dyn GpuFuture>>,
+    previous_frame_end: Vec<Option<Box<dyn GpuFuture>>>,
     recreate_swap_chain: bool,
 
     start_time: Instant,
+    frame_count: usize
 }
 
 impl HelloTriangleApplication {
@@ -193,7 +192,7 @@ impl HelloTriangleApplication {
 
         let descriptor_sets = Self::create_descriptor_set(&layout, &uniform_buffers);
 
-        let previous_frame_end = Some(Self::create_sync_objects(&device));
+        let previous_frame_end = Self::create_sync_objects(&device, swap_chain_images.len());
 
         info!("Init complete");
         let mut app = Self {
@@ -228,6 +227,7 @@ impl HelloTriangleApplication {
             recreate_swap_chain: false,
 
             start_time,
+            frame_count: 0,
         };
 
         app.create_command_buffers();
@@ -613,7 +613,7 @@ impl HelloTriangleApplication {
             .zip(self.descriptor_sets.iter())
             .map(|(framebuffer, descriptor)| {
                 Arc::new(
-                    AutoCommandBufferBuilder::primary_simultaneous_use(
+                    AutoCommandBufferBuilder::primary(//_simultaneous_use
                         self.device.clone(),
                         queue_family,
                     )
@@ -642,8 +642,12 @@ impl HelloTriangleApplication {
             .collect();
     }
 
-    fn create_sync_objects(device: &Arc<Device>) -> Box<dyn GpuFuture> {
-        Box::new(sync::now(device.clone())) as Box<dyn GpuFuture>
+    fn create_sync_objects(device: &Arc<Device>, num_images: usize) -> Vec<Option<Box<dyn GpuFuture>>> {
+        let mut ret = Vec::with_capacity(num_images);
+        for _ in 0..num_images {
+            ret.push(Some(Box::new(sync::now(device.clone())) as Box<dyn GpuFuture>));
+        }
+        ret
     }
 
     fn find_queue_families(
@@ -742,7 +746,6 @@ impl HelloTriangleApplication {
                         WindowEvent::CloseRequested => *control = ControlFlow::Exit,
                         _ => (),
                     }
-                    
                 }
                 Event::RedrawRequested(..) => (), //self.draw_frame(),
                 // Input device events
@@ -759,8 +762,9 @@ impl HelloTriangleApplication {
     }
 
     fn draw_frame(&mut self) {
-        debug!("Drawing frame");
-        // self.previous_frame_end.as_mut().unwrap().cleanup_finished();
+        self.frame_count+= 1;
+
+        
         if self.recreate_swap_chain {
             self.recreate_swap_chain();
             self.recreate_swap_chain = false;
@@ -776,19 +780,23 @@ impl HelloTriangleApplication {
                 }
                 Err(err) => panic!("{:?}", err),
             };
+        debug!("Drawing frame {}: {}/{}", self.frame_count, image_index, self.swap_chain_framebuffers.len());
+        self.previous_frame_end[image_index].as_mut().unwrap().cleanup_finished();
 
-        if let Ok(mut w) = self.uniform_buffers[image_index].write() {
-            *w = Self::update_uniform_buffer(self.start_time, self.swap_chain.dimensions());
-        }
-
+        // if let Ok(mut w) = self.uniform_buffers[image_index].write() {
+        //     debug!("Writing to uniform buffer");
+        //     *w = Self::update_uniform_buffer(self.start_time, self.swap_chain.dimensions());
+        // }
+        let prev = self.previous_frame_end[image_index].take().unwrap();
         let command_buffer = self.command_buffers[image_index].clone();
-        
+        // command_buffer
+        debug!("Join Futures");
+        let future = acquire_future.join(prev);
         debug!("Render");
-        let future = acquire_future
-            .then_execute(self.graphics_queue.clone(), command_buffer).unwrap();
-        
+        // let future = future.then_execute(self.graphics_queue.clone(), command_buffer);
+        let future = command_buffer.execute_after(future, self.graphics_queue.clone());
         debug!("Present");
-        let future = future
+        let future = future.unwrap()
             .then_swapchain_present(
                 self.present_queue.clone(),
                 self.swap_chain.clone(),
@@ -798,16 +806,16 @@ impl HelloTriangleApplication {
 
         match future {
             Ok(future) => {
-                self.previous_frame_end = Some(Box::new(future) as Box<_>);
+                self.previous_frame_end[image_index] = Some(Box::new(future) as Box<_>);
             }
             Err(vulkano::sync::FlushError::OutOfDate) => {
                 self.recreate_swap_chain = true;
-                self.previous_frame_end =
+                self.previous_frame_end[image_index] =
                     Some(Box::new(vulkano::sync::now(self.device.clone())) as Box<_>);
             }
             Err(e) => {
                 println!("{:?}", e);
-                self.previous_frame_end =
+                self.previous_frame_end[image_index] =
                     Some(Box::new(vulkano::sync::now(self.device.clone())) as Box<_>);
             }
         }
@@ -837,12 +845,13 @@ impl HelloTriangleApplication {
 
     fn recreate_swap_chain(&mut self) {
         debug!("Recreating swap chain");
-        let physical_device = PhysicalDevice::from_index(&self.instance, self.physical_device_index).unwrap();
-        let capabilities = self.surface
+        let physical_device =
+            PhysicalDevice::from_index(&self.instance, self.physical_device_index).unwrap();
+        let capabilities = self
+            .surface
             .capabilities(physical_device)
             .expect("failed to get surface capabilities");
         let extent = Self::choose_swap_extent(&capabilities);
-        
         let (sw, swi) = self.swap_chain.recreate_with_dimensions(extent).expect("");
         self.swap_chain = sw;
         self.swap_chain_images = swi;
@@ -850,19 +859,22 @@ impl HelloTriangleApplication {
         self.render_pass = render_pass;
 
         // ignores layout, since the layout is solely based on the shaderss
-        let (graphics_pipeline, _) =
-            Self::create_graphics_pipeline(&self.device, self.swap_chain.dimensions(), &self.render_pass);
-            self.graphics_pipeline = graphics_pipeline;
-        
-        self.swap_chain_framebuffers = Self::create_framebuffers(&self.swap_chain_images, &self.render_pass);
+        let (graphics_pipeline, _) = Self::create_graphics_pipeline(
+            &self.device,
+            self.swap_chain.dimensions(),
+            &self.render_pass,
+        );
+        self.graphics_pipeline = graphics_pipeline;
 
+        self.swap_chain_framebuffers =
+            Self::create_framebuffers(&self.swap_chain_images, &self.render_pass);
 
         self.create_command_buffers();
     }
 }
 
 fn main() {
-    env_logger::init();
+    env_logger::from_env(env_logger::Env::default().default_filter_or("debug")).init();
     let app = HelloTriangleApplication::initialize();
     app.main_loop();
 }
