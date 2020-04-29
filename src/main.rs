@@ -806,6 +806,7 @@ impl HelloTriangleApplication {
 
         match future {
             Ok(future) => {
+                future.wait(None).unwrap(); //Wait on frame, since we're re-using resources
                 self.previous_frame_end[image_index] = Some(Box::new(future) as Box<_>);
             }
             Err(vulkano::sync::FlushError::OutOfDate) => {
